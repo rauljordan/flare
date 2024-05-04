@@ -1,6 +1,9 @@
+use std::io::Read;
+
 use alloy_consensus::{SidecarCoder, SimpleCoder};
 use alloy_rlp::Decodable as _;
 use alloy_sol_types::{sol, SolEventInterface, SolInterface};
+use brotli2::read::{BrotliDecoder, BrotliEncoder};
 use reth::transaction_pool::TransactionPool;
 use reth_exex::{ExExContext, ExExEvent};
 use reth_node_api::FullNodeComponents;
@@ -54,17 +57,8 @@ impl<Node: FullNodeComponents> SequencerInboxReader<Node> {
                     SequencerInbox::addSequencerL2BatchCall { data, .. },
                 ) = call
                 {
-                    // let batch = batch.into_iter().map(|tx| tx.into()).collect::<Vec<_>>();
                     decode_transactions(self.ctx.pool(), tx, data).await?;
                 }
-                // let call = RollupContractCalls::abi_decode(tx.input(), true)?;
-
-                //     if let RollupContractCalls::submitBlock(RollupContract::submitBlockCall {
-                //         header,
-                //         blockData,
-                //         ..
-                //     }) = call
-                // decode_transactions(self.ctx.pool(), tx, block_data, block_data_hash)
             }
             _ => {
                 info!(tx = ?tx, "Received unknown event");
@@ -133,6 +127,12 @@ async fn decode_transactions<Pool: TransactionPool>(
     info!("Block data received");
 
     // TODO: Brotli decode the input blob.
+    let compressor = BrotliEncoder::new(raw_transactions.as_ref(), 11);
+    let mut decompressor = BrotliDecoder::new(compressor);
+    let mut raw_transactions = Vec::new();
+    decompressor.read_to_end(&mut raw_transactions)?;
+
+    info!("Decompressed brotli");
     Ok(())
 
     // let raw_transaction_hash = keccak256(&raw_transactions);
