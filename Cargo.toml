@@ -21,3 +21,4 @@ alloy-rlp = "0.3.4"
 foundry-blob-explorers = { git = "https://github.com/foundry-rs/block-explorers" }
 alloy-consensus = { git = "https://github.com/alloy-rs/alloy", rev = "af788af", features = ["kzg"]}
 brotli2 = "0.3.2"
+rusqlite = "0.31.0"

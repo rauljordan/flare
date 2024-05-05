@@ -1,67 +1,86 @@
 use std::io::Read;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use alloy_consensus::{SidecarCoder, SimpleCoder};
 use alloy_rlp::Decodable as _;
-use alloy_sol_types::{sol, SolEventInterface, SolInterface};
+use alloy_sol_types::{sol, SolEventInterface};
 use brotli2::read::{BrotliDecoder, BrotliEncoder};
 use reth::transaction_pool::TransactionPool;
 use reth_exex::{ExExContext, ExExEvent};
 use reth_node_api::FullNodeComponents;
 use reth_node_ethereum::EthereumNode;
+use reth_primitives::revm_primitives::FixedBytes;
+use reth_primitives::ruint::Uint;
 use reth_primitives::{
     address, eip4844::kzg_to_versioned_hash, Address, Bytes, SealedBlockWithSenders,
     TransactionSigned, TxType, B256,
 };
 use reth_provider::Chain;
 use reth_tracing::tracing::info;
+use rusqlite::Connection;
 
 sol!(SequencerInbox, "sequencer_inbox.abi");
-use SequencerInbox::{SequencerInboxCalls, SequencerInboxEvents};
+use SequencerInbox::SequencerInboxEvents;
+
+const DATABASE_PATH: &'static str = "sequencer_inbox.db";
+const ARBITRUM_SEPOLIA_SEQUENCER_INBOX: Address =
+    address!("6c97864CE4bEf387dE0b3310A44230f7E3F1be0D");
 
 pub struct SequencerInboxReader<Node: FullNodeComponents> {
     ctx: ExExContext<Node>,
+    db: Database,
 }
 
 impl<Node: FullNodeComponents> SequencerInboxReader<Node> {
-    fn new(ctx: ExExContext<Node>) -> eyre::Result<Self> {
-        Ok(Self { ctx })
+    fn new(ctx: ExExContext<Node>, db: Database) -> eyre::Result<Self> {
+        Ok(Self { ctx, db })
     }
 
     async fn run(mut self) -> eyre::Result<()> {
         while let Some(notif) = self.ctx.notifications.recv().await {
             if let Some(chain) = notif.committed_chain() {
+                info!("Committed chain received");
                 let events = decode_chain_into_events(&chain);
-                for (_, tx, event) in events {
-                    self.handle_sequencer_event(tx, event).await?;
+                for (block, tx, event) in events {
+                    self.handle_sequencer_event(block, tx, event).await?;
                 }
                 self.ctx
                     .events
                     .send(ExExEvent::FinishedHeight(chain.tip().number))?;
             }
+            // TODO: Handle reorg events.
         }
         Ok(())
     }
 
     async fn handle_sequencer_event(
         &mut self,
+        block: &SealedBlockWithSenders,
         tx: &TransactionSigned,
         event: SequencerInboxEvents,
     ) -> eyre::Result<()> {
         use SequencerInboxEvents::*;
         match event {
-            SequencerBatchDelivered(batch) => {
-                let seq = batch.batchSequenceNumber;
-                info!(batch_sequencer_number = ?seq, "Received batch");
-                let call = SequencerInboxCalls::abi_decode(tx.input(), true)?;
-                if let SequencerInboxCalls::addSequencerL2Batch(
-                    SequencerInbox::addSequencerL2BatchCall { data, .. },
-                ) = call
-                {
-                    decode_transactions(self.ctx.pool(), tx, data).await?;
-                }
+            SequencerBatchDelivered(_batch) => {
+                info!("Received batch delivery from sequencer inbox");
+            }
+            SequencerBatchData(_batch_data) => {
+                info!("Received batch data from sequencer inbox");
+            }
+            InboxMessageDelivered(message) => {
+                info!("Inbox mesage delivered");
+                let num = message.messageNum;
+                let batch =
+                    decode_transactions(self.ctx.pool(), num, block, tx, tx.input().clone())
+                        .await?;
+                self.db.insert_batch(batch)?;
+                info!("Saved batch to database");
+            }
+            InboxMessageDeliveredFromOrigin(_message) => {
+                info!("Inbox mesage delivered from origin");
             }
             _ => {
-                info!(tx = ?tx, "Received unknown event");
+                info!(tx = ?tx, "Unknown event");
             }
         }
         Ok(())
@@ -70,12 +89,14 @@ impl<Node: FullNodeComponents> SequencerInboxReader<Node> {
 
 async fn decode_transactions<Pool: TransactionPool>(
     pool: &Pool,
+    message_num: Uint<256, 4>,
+    block: &SealedBlockWithSenders,
     tx: &TransactionSigned,
-    block_data: Bytes,
-    // block_data_hash: B256,
-) -> eyre::Result<()> {
+    tx_input: Bytes,
+) -> eyre::Result<Batch> {
     // Get raw transactions either from the blobs, or directly from the block data
-    let raw_transactions = if matches!(tx.tx_type(), TxType::Eip4844) {
+    let compressed_batch_data = if matches!(tx.tx_type(), TxType::Eip4844) {
+        info!("Received batch data as blob");
         let blobs: Vec<_> = if let Some(sidecar) = pool.get_blob(tx.hash)? {
             // Try to get blobs from the transaction pool
             sidecar.blobs.into_iter().zip(sidecar.commitments).collect()
@@ -97,7 +118,7 @@ async fn decode_transactions<Pool: TransactionPool>(
         };
 
         // Decode blob hashes from block data
-        let blob_hashes = Vec::<B256>::decode(&mut block_data.as_ref())?;
+        let blob_hashes = Vec::<B256>::decode(&mut tx_input.as_ref())?;
 
         // Filter blobs that are present in the block data
         let blobs = blobs
@@ -118,41 +139,27 @@ async fn decode_transactions<Pool: TransactionPool>(
             .ok_or(eyre::eyre!("failed to decode blobs"))?
             .concat();
 
-        info!("Received blob data");
         data.into()
     } else {
-        block_data
+        info!("Received batch as calldata");
+        tx_input
     };
 
-    info!("Block data received");
-
-    // TODO: Brotli decode the input blob.
-    let compressor = BrotliEncoder::new(raw_transactions.as_ref(), 11);
+    let compressor = BrotliEncoder::new(compressed_batch_data.as_ref(), 11);
     let mut decompressor = BrotliDecoder::new(compressor);
     let mut raw_transactions = Vec::new();
     decompressor.read_to_end(&mut raw_transactions)?;
 
-    info!("Decompressed brotli");
-    Ok(())
-
-    // let raw_transaction_hash = keccak256(&raw_transactions);
-    // if raw_transaction_hash != block_data_hash {
-    //     eyre::bail!("block data hash mismatch")
-    // }
-
-    // // Decode block data, filter only transactions with the correct chain ID and recover senders
-    // let transactions = Vec::<TransactionSigned>::decode(&mut raw_transactions.as_ref())?
-    //     .into_iter()
-    //     // .filter(|tx| tx.chain_id() == Some(CHAIN_ID))
-    //     .map(|tx| {
-    //         let sender = tx
-    //             .recover_signer()
-    //             .ok_or(eyre::eyre!("failed to recover signer"))?;
-    //         Ok((tx, sender))
-    //     })
-    //     .collect::<eyre::Result<_>>()?;
-
-    // Ok(transactions)
+    info!(
+        "Decompressed brotli batch successfully of len {}",
+        raw_transactions.len()
+    );
+    Ok(Batch {
+        seq_num: message_num,
+        tx_hash: tx.hash(),
+        data: Bytes::from(raw_transactions),
+        block_number: block.block.number,
+    })
 }
 
 /// Decode chain of blocks into a flattened list of receipt logs, filter only
@@ -164,7 +171,6 @@ fn decode_chain_into_events(
     &TransactionSigned,
     SequencerInboxEvents,
 )> {
-    let inbox_address: Address = address!("6c97864CE4bEf387dE0b3310A44230f7E3F1be0D");
     chain
         // Get all blocks and receipts
         .blocks_and_receipts()
@@ -177,7 +183,7 @@ fn decode_chain_into_events(
                 .map(move |(tx, receipt)| (block, tx, receipt))
         })
         // Filter only transactions to the rollup contract
-        .filter(|(_, tx, _)| tx.to() == Some(inbox_address))
+        .filter(|(_, tx, _)| tx.to() == Some(ARBITRUM_SEPOLIA_SEQUENCER_INBOX))
         // Get all logs
         .flat_map(|(block, tx, receipt)| receipt.logs.iter().map(move |log| (block, tx, log)))
         // Decode and filter events
@@ -189,12 +195,69 @@ fn decode_chain_into_events(
         .collect()
 }
 
+pub struct Database {
+    connection: Arc<Mutex<Connection>>,
+}
+
+impl Database {
+    pub fn new(connection: Connection) -> eyre::Result<Self> {
+        let database = Self {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+        database.create_tables()?;
+        Ok(database)
+    }
+
+    fn connection(&self) -> MutexGuard<'_, Connection> {
+        self.connection
+            .lock()
+            .expect("failed to acquire database lock")
+    }
+
+    fn create_tables(&self) -> eyre::Result<()> {
+        self.connection().execute_batch(
+            "CREATE TABLE IF NOT EXISTS batch (
+                seq_num      TEXT PRIMARY KEY,
+                tx_hash      TEXT UNIQUE,
+                data         TEXT,
+                block_number INTEGER
+            );",
+        )?;
+        Ok(())
+    }
+
+    fn insert_batch(&mut self, batch: Batch) -> eyre::Result<()> {
+        let mut connection = self.connection();
+        let tx = connection.transaction()?;
+        tx.execute(
+            "INSERT INTO batch (seq_num, tx_hash, data, block_number) VALUES (?, ?, ?, ?)",
+            (
+                batch.seq_num.to_string(),
+                batch.tx_hash.to_string(),
+                batch.data.to_string(),
+                batch.block_number,
+            ),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+struct Batch {
+    seq_num: Uint<256, 4>,
+    tx_hash: FixedBytes<32>,
+    data: Bytes,
+    block_number: u64,
+}
+
 fn main() -> eyre::Result<()> {
     reth::cli::Cli::parse_args().run(|builder, _| async move {
         let handle = builder
             .node(EthereumNode::default())
             .install_exex("SequencerInboxReader", move |ctx| async {
-                Ok(SequencerInboxReader::new(ctx)?.run())
+                let connection = Connection::open(DATABASE_PATH)?;
+                let db = Database::new(connection)?;
+                Ok(SequencerInboxReader::new(ctx, db)?.run())
             })
             .launch()
             .await?;
